@@ -20,6 +20,14 @@ local OpenAI-compatible server so coding tools get the same routing.
 
 ---
 
+## Download
+
+Prebuilt packages are attached to the
+[latest release](https://github.com/ajsd939/gemini-router/releases/latest):
+
+* **Windows** — `Gemini Router_<Version>_x64-setup.exe` (NSIS installer)
+* **Linux** — `Gemini Router_<Version>_amd64.AppImage` (`chmod +x` it before running)
+
 ## Prerequisites
 
 * **Rust** stable (tested on 1.99, MSVC toolchain) — `rustup` with the `x86_64-pc-windows-msvc` target

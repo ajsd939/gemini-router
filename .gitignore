@@ -7,6 +7,7 @@
 
 # Local build output
 /dist/
+/artifacts/
 
 # OS noise
 .DS_Store
