@@ -167,6 +167,30 @@ fn generation_config(req: &Value) -> Option<Value> {
             generation.insert("stopSequences".into(), json!(stops));
         }
     }
+    // Claude Code requests extended thinking with a budget. Honour it (capped)
+    // so Gemini does not think indefinitely; disable thinking when the client
+    // explicitly turns it off.
+    if let Some(thinking) = req.get("thinking") {
+        let mut tc = Map::new();
+        match thinking.get("type").and_then(Value::as_str) {
+            Some("enabled") => {
+                let budget = thinking
+                    .get("budget_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(8192)
+                    .min(16384);
+                tc.insert("thinkingBudget".into(), json!(budget));
+                tc.insert("includeThoughts".into(), json!(false));
+            }
+            Some("disabled") => {
+                tc.insert("thinkingBudget".into(), json!(0));
+            }
+            _ => {}
+        }
+        if !tc.is_empty() {
+            generation.insert("thinkingConfig".into(), Value::Object(tc));
+        }
+    }
     if generation.is_empty() {
         None
     } else {
@@ -354,6 +378,17 @@ pub fn response_to_anthropic(resp: &Value, model: &str) -> Value {
         .and_then(Value::as_array)
     {
         for part in parts {
+            // Gemini's internal "thought" parts are not Anthropic thinking
+            // blocks; emitting them as text makes Claude Code loop forever.
+            // Collect any signature they carry, then skip them.
+            if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                if let Some(signature) = crate::signatures::from_part(part) {
+                    if let Some(id) = &first_tool_id {
+                        crate::signatures::put(id, &signature);
+                    }
+                }
+                continue;
+            }
             if let Some(text) = part.get("text").and_then(Value::as_str) {
                 if !text.is_empty() {
                     content.push(json!({ "type": "text", "text": text }));
@@ -541,6 +576,14 @@ impl StreamTranslator {
             .and_then(Value::as_array)
         {
             for part in parts {
+                if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                    if let Some(signature) = crate::signatures::from_part(part) {
+                        if let Some(id) = &self.first_tool_id {
+                            crate::signatures::put(id, &signature);
+                        }
+                    }
+                    continue;
+                }
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
                     if !text.is_empty() {
                         let index = self.ensure_text_block(&mut out);

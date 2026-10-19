@@ -345,12 +345,16 @@ fn apply_claude_settings(
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     ] {
-        if env
+        let should_remove = env
             .get(key)
             .and_then(Value::as_str)
-            .and_then(Mode::parse)
-            .is_some()
-        {
+            .map(|v| {
+                Mode::parse(v).is_some()
+                    || v.to_lowercase().contains("gemini")
+                    || v.to_lowercase().contains("flash")
+            })
+            .unwrap_or(false);
+        if should_remove {
             env.remove(key);
         }
     }
