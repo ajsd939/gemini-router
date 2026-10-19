@@ -12,6 +12,7 @@ mod openai;
 mod responses;
 mod router;
 mod server;
+mod signatures;
 mod state;
 
 use std::sync::Arc;

@@ -363,6 +363,11 @@ pub fn chat_request_to_gemini(req: &Value) -> Result<Value, String> {
                     parts.push(json!({ "text": text }));
                 }
                 if let Some(calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
+                    // Gemini only needs the signature on the first function
+                    // call of a parallel group.  If the original signature is
+                    // gone (imported history, older conversation), the
+                    // documented sentinel keeps the request valid.
+                    let mut first_tool = true;
                     for call in calls {
                         let f = call.get("function").cloned().unwrap_or(Value::Null);
                         let name = f
@@ -379,10 +384,17 @@ pub fn chat_request_to_gemini(req: &Value) -> Result<Value, String> {
                             .unwrap_or_default()
                             .to_string();
                         if !id.is_empty() {
-                            id_to_name.insert(id, name.clone());
+                            id_to_name.insert(id.clone(), name.clone());
                         }
                         let args = parse_args(&f.get("arguments").cloned().unwrap_or(Value::Null));
-                        parts.push(json!({ "functionCall": { "name": name, "args": args } }));
+                        let mut part = json!({ "functionCall": { "name": name, "args": args } });
+                        if first_tool {
+                            let signature = crate::signatures::for_replay(call, &id)
+                                .unwrap_or_else(|| crate::signatures::SKIP_VALIDATOR.to_string());
+                            part["thoughtSignature"] = json!(signature);
+                            first_tool = false;
+                        }
+                        parts.push(part);
                     }
                 }
                 push_content(&mut contents, "model", parts);
@@ -524,14 +536,24 @@ fn extract_tool_calls(resp: &Value) -> Vec<Value> {
                     let call = part.get("functionCall")?;
                     let name = call.get("name")?.as_str()?.to_string();
                     let args = call.get("args").cloned().unwrap_or_else(|| json!({}));
-                    Some(json!({
-                        "id": format!("call_{index}_{}", short_id()),
+                    let id = format!("call_{index}_{}", short_id());
+                    let signature = crate::signatures::from_part(part);
+                    if let Some(signature) = &signature {
+                        crate::signatures::put(&id, signature);
+                    }
+                    let mut call = json!({
+                        "id": id,
                         "type": "function",
                         "function": {
                             "name": name,
                             "arguments": serde_json::to_string(&args).unwrap_or_else(|_| "{}".into())
                         }
-                    }))
+                    });
+                    if let Some(signature) = signature {
+                        call["extra_content"] =
+                            json!({ "google": { "thought_signature": signature } });
+                    }
+                    Some(call)
                 })
                 .collect()
         })
@@ -609,6 +631,8 @@ fn delta_chunk(id: &str, model: &str, created: i64, delta: Value, finish: Option
 #[derive(Debug, Default)]
 pub struct StreamTranslator {
     emitted_tool_calls: bool,
+    /// Gemini puts the signature on the first function-call part of a turn.
+    first_tool_id: Option<String>,
 }
 
 impl StreamTranslator {
@@ -642,15 +666,27 @@ impl StreamTranslator {
                         .unwrap_or_default()
                         .to_string();
                     let args = call.get("args").cloned().unwrap_or_else(|| json!({}));
-                    let tool_call = json!({
+                    let tool_id = format!("call_{index}_{}", short_id());
+                    let signature = crate::signatures::from_part(part);
+                    if let Some(signature) = &signature {
+                        crate::signatures::put(&tool_id, signature);
+                    }
+                    if self.first_tool_id.is_none() {
+                        self.first_tool_id = Some(tool_id.clone());
+                    }
+                    let mut tool_call = json!({
                         "index": index,
-                        "id": format!("call_{index}_{}", short_id()),
+                        "id": tool_id,
                         "type": "function",
                         "function": {
                             "name": name,
                             "arguments": serde_json::to_string(&args).unwrap_or_else(|_| "{}".into())
                         }
                     });
+                    if let Some(signature) = signature {
+                        tool_call["extra_content"] =
+                            json!({ "google": { "thought_signature": signature } });
+                    }
                     out.push(delta_chunk(
                         id,
                         model,
@@ -658,6 +694,15 @@ impl StreamTranslator {
                         json!({ "tool_calls": [tool_call] }),
                         None,
                     ));
+                } else if let Some(signature) = crate::signatures::from_part(part) {
+                    // A signature may arrive in a follow-up part.  Only attach
+                    // it when no visible text is present, so text signatures
+                    // are not misattributed to the tool call.
+                    if part.get("text").is_none() {
+                        if let Some(tool_id) = &self.first_tool_id {
+                            crate::signatures::put(tool_id, &signature);
+                        }
+                    }
                 }
             }
         }
@@ -1106,6 +1151,160 @@ mod tests {
         assert_eq!(out["object"], "text_completion");
         assert_eq!(out["choices"][0]["text"], "done");
         assert_eq!(out["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn thought_signature_survives_a_tool_call_round_trip() {
+        let resp = json!({
+            "candidates": [{ "content": { "parts": [{
+                "functionCall": { "name": "shell", "args": { "cmd": "ls" } },
+                "thoughtSignature": "sig-1"
+            }] } }]
+        });
+        let out = gemini_response_to_chat(&resp, "m", 1);
+        let call_id = out["choices"][0]["message"]["tool_calls"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let req = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": { "name": "shell", "arguments": "{\"cmd\":\"ls\"}" }
+                    }]
+                },
+                { "role": "tool", "tool_call_id": call_id, "content": "ok" }
+            ]
+        });
+        let body = chat_request_to_gemini(&req).unwrap();
+        assert_eq!(body["contents"][0]["parts"][0]["thoughtSignature"], "sig-1");
+    }
+
+    #[test]
+    fn missing_thought_signature_uses_the_skip_sentinel() {
+        let id = format!("call_missing_{}", short_id());
+        let req = json!({
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": "f", "arguments": "{}" }
+                }]
+            }]
+        });
+        let body = chat_request_to_gemini(&req).unwrap();
+        assert_eq!(
+            body["contents"][0]["parts"][0]["thoughtSignature"],
+            crate::signatures::SKIP_VALIDATOR
+        );
+    }
+
+    #[test]
+    fn only_the_first_parallel_tool_call_gets_a_signature() {
+        let req = json!({
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {
+                        "id": format!("call_par_a_{}", short_id()),
+                        "type": "function",
+                        "function": { "name": "a", "arguments": "{}" }
+                    },
+                    {
+                        "id": format!("call_par_b_{}", short_id()),
+                        "type": "function",
+                        "function": { "name": "b", "arguments": "{}" }
+                    }
+                ]
+            }]
+        });
+        let body = chat_request_to_gemini(&req).unwrap();
+        assert_eq!(
+            body["contents"][0]["parts"][0]["thoughtSignature"],
+            crate::signatures::SKIP_VALIDATOR
+        );
+        assert!(
+            body["contents"][0]["parts"][1]
+                .get("thoughtSignature")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extra_content_signature_is_replayed() {
+        let req = json!({
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call_extra_{}", short_id()),
+                    "type": "function",
+                    "extra_content": {
+                        "google": { "thought_signature": "sig-extra" }
+                    },
+                    "function": { "name": "f", "arguments": "{}" }
+                }]
+            }]
+        });
+        let body = chat_request_to_gemini(&req).unwrap();
+        assert_eq!(
+            body["contents"][0]["parts"][0]["thoughtSignature"],
+            "sig-extra"
+        );
+    }
+
+    #[test]
+    fn streaming_thought_signature_is_cached_for_replay() {
+        let mut translator = StreamTranslator::default();
+        let chunk = json!({
+            "candidates": [{ "content": { "parts": [{
+                "functionCall": { "name": "f", "args": { "a": 1 } },
+                "thoughtSignature": "sig-stream"
+            }] } }]
+        });
+        let out = translator.translate(&chunk, "id", "m", 1);
+        let call_id = out[0]["choices"][0]["delta"]["tool_calls"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            crate::signatures::get(&call_id).as_deref(),
+            Some("sig-stream")
+        );
+    }
+
+    #[test]
+    fn streaming_signature_in_a_followup_part_attaches_to_the_first_call() {
+        let mut translator = StreamTranslator::default();
+        let call = json!({
+            "candidates": [{ "content": { "parts": [{
+                "functionCall": { "name": "f", "args": { "a": 1 } }
+            }] } }]
+        });
+        let first = translator.translate(&call, "id", "m", 1);
+        let call_id = first[0]["choices"][0]["delta"]["tool_calls"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let signature = json!({
+            "candidates": [{ "content": { "parts": [
+                { "thoughtSignature": "sig-late" }
+            ] } }]
+        });
+        translator.translate(&signature, "id", "m", 1);
+        assert_eq!(
+            crate::signatures::get(&call_id).as_deref(),
+            Some("sig-late")
+        );
     }
 
     #[test]

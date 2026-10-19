@@ -484,21 +484,39 @@ pub fn extract_text(resp: &Value) -> String {
 struct GeminiCall {
     name: String,
     args: Value,
+    signature: Option<String>,
 }
 
 fn extract_calls(resp: &Value) -> Vec<GeminiCall> {
     resp.pointer("/candidates/0/content/parts")
         .and_then(Value::as_array)
         .map(|parts| {
-            parts
-                .iter()
-                .filter_map(|part| {
-                    let call = part.get("functionCall")?;
-                    let name = call.get("name")?.as_str()?.to_string();
+            let mut calls: Vec<GeminiCall> = Vec::new();
+            for part in parts {
+                if let Some(call) = part.get("functionCall") {
+                    let Some(name) = call.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
                     let args = call.get("args").cloned().unwrap_or_else(|| json!({}));
-                    Some(GeminiCall { name, args })
-                })
-                .collect()
+                    calls.push(GeminiCall {
+                        name: name.to_string(),
+                        args,
+                        signature: crate::signatures::from_part(part),
+                    });
+                } else if let Some(signature) = crate::signatures::from_part(part) {
+                    // In the non-streaming API the signature normally sits on
+                    // the first function-call part, but tolerate a separate
+                    // signature-only part as well.
+                    if part.get("text").is_none() {
+                        if let Some(first) = calls.first_mut() {
+                            if first.signature.is_none() {
+                                first.signature = Some(signature);
+                            }
+                        }
+                    }
+                }
+            }
+            calls
         })
         .unwrap_or_default()
 }
@@ -525,6 +543,12 @@ fn call_item(call: &GeminiCall, tools: &ToolMap) -> Value {
     } else {
         format!("fc_{}", crate::openai::short_id())
     };
+    if let Some(signature) = &call.signature {
+        // Cache under both ids: clients may reply with `call_id` or with the
+        // output item `id`.
+        crate::signatures::put(&call_id, signature);
+        crate::signatures::put(&item_id, signature);
+    }
 
     let mut item = if tools.is_custom(&call.name) {
         let input = call
@@ -633,6 +657,8 @@ pub struct StreamTranslator {
     text: Option<TextItem>,
     output: Vec<Value>,
     usage: Value,
+    /// Gemini puts the signature on the first function-call part of a turn.
+    first_call_id: Option<String>,
 }
 
 impl StreamTranslator {
@@ -646,6 +672,7 @@ impl StreamTranslator {
             text: None,
             output: Vec::new(),
             usage: usage_object(&json!({})),
+            first_call_id: None,
         }
     }
 
@@ -701,7 +728,14 @@ impl StreamTranslator {
                     // before the tool call that follows it.
                     self.finalize_text(&mut events);
                     let args = call.get("args").cloned().unwrap_or_else(|| json!({}));
-                    self.push_call(name, &args, &mut events);
+                    let signature = crate::signatures::from_part(part);
+                    self.push_call(name, &args, signature.as_deref(), &mut events);
+                } else if let Some(signature) = crate::signatures::from_part(part) {
+                    if part.get("text").is_none() {
+                        if let Some(call_id) = &self.first_call_id {
+                            crate::signatures::put(call_id, &signature);
+                        }
+                    }
                 }
             }
         }
@@ -836,12 +870,32 @@ impl StreamTranslator {
         self.output.push(done);
     }
 
-    fn push_call(&mut self, gemini_name: &str, args: &Value, events: &mut Vec<(String, Value)>) {
+    fn push_call(
+        &mut self,
+        gemini_name: &str,
+        args: &Value,
+        signature: Option<&str>,
+        events: &mut Vec<(String, Value)>,
+    ) {
         let (namespace, name) = self.tools.output_name(gemini_name);
         let call_id = format!("call_{}", crate::openai::short_id());
         let index = self.next_output_index;
         self.next_output_index += 1;
         let custom = self.tools.is_custom(gemini_name);
+        let item_id = if custom {
+            format!("ctc_{}", crate::openai::short_id())
+        } else {
+            format!("fc_{}", crate::openai::short_id())
+        };
+        if let Some(signature) = signature {
+            // Cache under both ids: clients may reply with `call_id` or with
+            // the output item `id`.
+            crate::signatures::put(&call_id, signature);
+            crate::signatures::put(&item_id, signature);
+        }
+        if self.first_call_id.is_none() {
+            self.first_call_id = Some(call_id.clone());
+        }
 
         if custom {
             let input = args
@@ -851,7 +905,7 @@ impl StreamTranslator {
                 .unwrap_or_else(|| serde_json::to_string(args).unwrap_or_default());
             let mut added = json!({
                 "type": "custom_tool_call",
-                "id": format!("ctc_{}", crate::openai::short_id()),
+                "id": item_id,
                 "call_id": call_id,
                 "name": name,
                 "input": "",
@@ -886,7 +940,7 @@ impl StreamTranslator {
             let arguments = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
             let mut added = json!({
                 "type": "function_call",
-                "id": format!("fc_{}", crate::openai::short_id()),
+                "id": item_id,
                 "call_id": call_id,
                 "name": name,
                 "arguments": "",
@@ -1076,5 +1130,50 @@ mod tests {
         assert_eq!(usage["output_tokens"], 4);
         assert_eq!(usage["total_tokens"], 11);
         assert!(usage["output_tokens_details"]["reasoning_tokens"].is_number());
+    }
+
+    #[test]
+    fn response_function_call_signature_is_cached_and_replayed() {
+        let resp = json!({
+            "candidates": [{ "content": { "parts": [{
+                "functionCall": { "name": "shell", "args": { "cmd": "ls" } },
+                "thoughtSignature": "sig-r"
+            }] } }]
+        });
+        let out = response_from_gemini(&resp, "flash", 1, &ToolMap::default());
+        let item = &out["output"][0];
+        let call_id = item["call_id"].as_str().unwrap().to_string();
+        let item_id = item["id"].as_str().unwrap().to_string();
+        assert_eq!(crate::signatures::get(&call_id).as_deref(), Some("sig-r"));
+        assert_eq!(crate::signatures::get(&item_id).as_deref(), Some("sig-r"));
+
+        let req = json!({
+            "input": [
+                { "type": "message", "role": "user", "content": "run" },
+                { "type": "function_call", "name": "shell", "arguments": "{\"cmd\":\"ls\"}", "call_id": call_id },
+                { "type": "function_call_output", "call_id": call_id, "output": "ok" }
+            ]
+        });
+        let body = request_to_gemini(&req, &ToolMap::default()).unwrap();
+        assert_eq!(body["contents"][1]["parts"][0]["thoughtSignature"], "sig-r");
+    }
+
+    #[test]
+    fn streaming_response_caches_signature_for_replay() {
+        let mut translator = StreamTranslator::new("flash", ToolMap::default());
+        let events = translator.translate(&json!({
+            "candidates": [{ "content": { "parts": [{
+                "functionCall": { "name": "shell", "args": { "cmd": "ls" } },
+                "thoughtSignature": "sig-rs"
+            }] } }]
+        }));
+        let (_, done) = events
+            .iter()
+            .find(|(kind, data)| {
+                kind == "response.output_item.done" && data["item"]["type"] == "function_call"
+            })
+            .unwrap();
+        let call_id = done["item"]["call_id"].as_str().unwrap();
+        assert_eq!(crate::signatures::get(call_id).as_deref(), Some("sig-rs"));
     }
 }

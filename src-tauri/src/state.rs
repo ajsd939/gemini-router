@@ -290,6 +290,7 @@ impl AppState {
             .map_err(|e| format!("could not resolve the app data directory: {e}"))?;
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("could not create {}: {e}", data_dir.display()))?;
+        crate::signatures::init(&data_dir);
 
         let config = config::load_config(&data_dir);
         let mut settings = config::load_settings(&data_dir);
