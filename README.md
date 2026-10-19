@@ -20,28 +20,6 @@ local OpenAI-compatible server so coding tools get the same routing.
 
 ---
 
-## Decisions taken (read this first)
-
-Two things in the original brief contradicted each other, and two default model IDs did not
-exist. Both were confirmed before building:
-
-| Question | Resolution |
-| --- | --- |
-| Key area said "add more slots" but also "only one key field, do not add multiple-key support" | **Multiple key slots.** The Key area starts with 1 slot; **Add key slot** adds one more per press |
-| `gemini-3.7-flash`, `gemini-3.5-flash` are not real endpoints | **Dropped** — `flash_chain` is the two stable models only |
-
-Checked against <https://ai.google.dev/gemini-api/docs/models> (page updated 2026-10-13):
-`gemini-3.8-flash` ✅, `gemini-3.6-flash` ✅, `gemini-3.5-flash-lite` ✅, `gemini-3.1-flash-lite` ✅,
-`gemini-3.7-flash` ❌ no such model, `gemini-3.5-flash` ❌ no such model.
-
-Because more than one key slot now exists, the routing rule "never switch to a second API key"
-was reinterpreted as: **a key is only left once it has nothing left to try.** Within a single
-model attempt we never hop keys; across slots we fail over. Waiting only happens when *every*
-slot is blocked. All availability state is tracked per `(key slot, model)` pair, because two keys
-can belong to two Google Cloud projects with independent quotas.
-
----
-
 ## Prerequisites
 
 * **Rust** stable (tested on 1.99, MSVC toolchain) — `rustup` with the `x86_64-pc-windows-msvc` target
