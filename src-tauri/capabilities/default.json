@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Permissions for the main Gemini Router window.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Gemini Router</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="banner" class="banner hidden"></div>
+
+    <main>
+      <!-- 1 ------------------------------------------------------------------>
+      <section class="card">
+        <h2><span class="num">1</span> Key area</h2>
+        <p id="keychain-note" class="note"></p>
+        <div id="key-slots"></div>
+        <div class="row">
+          <button id="add-key-slot">Add key slot</button>
+          <span class="note">
+            Only one key field is used per request. Extra slots act as failover when a key
+            is out of quota.
+          </span>
+        </div>
+      </section>
+
+      <!-- 2 ------------------------------------------------------------------>
+      <section class="card">
+        <h2><span class="num">2</span> Mode</h2>
+        <div id="mode-buttons" class="mode-buttons"></div>
+        <div id="chains" class="chains"></div>
+
+        <details class="editor" id="chain-editor">
+          <summary>Edit model chains</summary>
+          <div class="chain-fields">
+            <label for="flash-chain-input">flash chain</label>
+            <input id="flash-chain-input" class="mono" autocomplete="off" spellcheck="false" />
+            <label for="flash-lite-chain-input">flash_lite chain</label>
+            <input id="flash-lite-chain-input" class="mono" autocomplete="off" spellcheck="false" />
+          </div>
+          <div class="row">
+            <button id="save-chains" class="primary">Save chains</button>
+            <button id="reload-config" class="ghost">Reload config.json</button>
+            <span id="config-path" class="note mono"></span>
+          </div>
+          <p class="note">
+            Comma-separated model IDs, tried in order. Saved to config.json and applied to the
+            next request. Reload picks up hand edits without restarting the app.
+          </p>
+        </details>
+
+        <p class="note">Mode changes apply from the next request onward.</p>
+      </section>
+
+      <!-- 3 ------------------------------------------------------------------>
+      <section class="card">
+        <h2><span class="num">3</span> Prompt and response</h2>
+        <textarea id="prompt" rows="4" placeholder="Write a prompt… (Ctrl+Enter to send)"></textarea>
+        <div class="row">
+          <button id="send" class="primary">Send</button>
+          <span id="handled" class="note"></span>
+        </div>
+        <pre id="response" class="response"></pre>
+      </section>
+
+      <!-- 4 ------------------------------------------------------------------>
+      <section class="card">
+        <h2><span class="num">4</span> Model status</h2>
+        <div class="row">
+          <label for="status-slot">Key slot</label>
+          <select id="status-slot"></select>
+          <span class="note">Cooldowns and daily exhaustion are tracked per key slot and model.</span>
+        </div>
+        <table class="grid">
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th>Chain</th>
+              <th>State</th>
+            </tr>
+          </thead>
+          <tbody id="model-rows"></tbody>
+        </table>
+      </section>
+
+      <!-- 5 ------------------------------------------------------------------>
+      <section class="card">
+        <h2><span class="num">5</span> Connect tools</h2>
+        <div class="row">
+          <button id="server-start" class="primary">Start</button>
+          <button id="server-stop">Stop</button>
+          <span id="server-state" class="note"></span>
+        </div>
+        <div class="row">
+          <label for="port">Port</label>
+          <input id="port" type="number" min="1" max="65535" class="short" />
+          <label for="address">Base URL</label>
+          <input id="address" readonly class="wide mono" />
+        </div>
+        <div class="row">
+          <label class="checkbox">
+            <input type="checkbox" id="api-wait" />
+            Let the server wait for a model to come back
+          </label>
+          <label for="api-max-wait">max wait (s)</label>
+          <input id="api-max-wait" type="number" min="5" max="3600" class="short" />
+        </div>
+        <p class="note">
+          Point any OpenAI-compatible tool at the base URL, e.g.
+          <code>OPENAI_BASE_URL=http://127.0.0.1:8787/v1</code>. Use a token below as the API key.
+          The mode name may also be sent as the <code>model</code> field to override routing per request.
+        </p>
+
+        <h3>Access tokens</h3>
+        <div id="tokens"></div>
+        <div class="row">
+          <button id="add-token">Add key slot</button>
+          <span class="note">Each press adds one more access token for the local server.</span>
+        </div>
+
+        <h3>Inject into a coding tool</h3>
+        <p class="note">
+          Writes the tool's user-level config to point at this router, starting the server and
+          creating an access token if needed. Pick a mode to pin it for that tool only; the app's
+          own mode is left alone.
+        </p>
+        <div class="row">
+          <label for="inject-mode">Mode</label>
+          <select id="inject-mode">
+            <option value="current">current app mode</option>
+            <option value="flash">flash</option>
+            <option value="flash_lite">flash_lite</option>
+            <option value="both">both</option>
+          </select>
+          <span class="note">Applied per request via the <code>model</code> field.</span>
+        </div>
+        <div id="inject-targets" class="inject-targets"></div>
+        <div id="inject-results"></div>
+      </section>
+
+      <!-- 6 ------------------------------------------------------------------>
+      <section class="card">
+        <h2><span class="num">6</span> Request log</h2>
+        <div class="row">
+          <button id="clear-log" class="ghost">Clear</button>
+        </div>
+        <table class="grid log">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Source</th>
+              <th>Mode</th>
+              <th>Model</th>
+              <th>Status</th>
+              <th>Latency</th>
+              <th>Detail</th>
+            </tr>
+          </thead>
+          <tbody id="log-rows"></tbody>
+        </table>
+      </section>
+    </main>
+
+    <script src="main.js"></script>
+  </body>
+</html>

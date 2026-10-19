@@ -1,0 +1,13 @@
+# Rust / Tauri
+/src-tauri/target/
+/src-tauri/gen/
+
+# Generated icons (recreate with: python tools/make_icons.py)
+/src-tauri/icons/
+
+# Local build output
+/dist/
+
+# OS noise
+.DS_Store
+Thumbs.db
